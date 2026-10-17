@@ -37,6 +37,7 @@ from .vlm_compat52 import (
     set_diffuse_color_pass_enabled,
 )
 from . import vlm_collections
+from . import vlm_join_rules
 from PIL import Image # External dependency
 
 logger = vlm_utils.logger
@@ -879,7 +880,9 @@ def render_all_groups(op, context):
     # objects that need it are baked together:
     #  - static objects (not 'hide from others') that are not in any light-linking collection of the scenario's lights
     #    are joined into one temporary mesh; each keeps its own materials, so each one bakes into its own image,
-    #  - 'hide from others' objects (alternate poses of movables) and light-linked objects are baked alone, as before.
+    #  - 'hide from others' objects (alternate poses of movables) and light-linked objects are baked alone, as before,
+    #  - the vlm_join_rules decide which of the others may share a joined object (object dependent shading rewritten into
+    #    per object constants, parts that must bake alone, join key, transparency), so one scenario may need several joins.
     # Then each object's bake is denoised, saved and its influence map rendered exactly as before (same files).
     render_ratio = context.scene.vlmSettings.render_ratio / 100.0
     depsgraph = context.view_layer.depsgraph
@@ -1175,6 +1178,68 @@ def render_all_groups(op, context):
             if p['obj'].vlmSettings.bake_mask:
                 render_col.objects.unlink(p['obj'].vlmSettings.bake_mask)
 
+    # A part with a bake mask always bakes alone (its mask would shadow the other members, and a shared mask cannot be
+    # linked twice). scene['vlm_bake_alone'] = comma-separated object names that bake alone. Transparent parts are kept out
+    # of the joins of the parts they overlap (vlm_join_rules). scene['vlm_joined_bake'] = True turns joining on.
+    join_on = bool(context.scene.get('vlm_joined_bake', False))   # opt-in until the joined-bake rules are settled
+    bake_alone = {n.strip() for n in str(context.scene.get('vlm_bake_alone', '')).split(',') if n.strip()}
+
+    def _prepare_join(part):
+        """Joined bakes: rewrite the part's object dependent shading into constants of the part, on new material copies
+        that are kept only if the part may be joined, then record its join key, transparency and padded silhouette."""
+        dup = part['dup']
+        new_mats, new_groups, memo, left = {}, [], {}, set()
+        reason = vlm_join_rules.part_alone_reason(part['obj'], dup)
+        if reason:
+            left.add(reason)
+        else:
+            ctx = vlm_join_rules.part_context(dup)
+            for mi, mat in enumerate(dup.data.materials):
+                if mat is not None:
+                    new_mats[mi] = mat.copy()
+                    left |= vlm_join_rules.rewrite(new_mats[mi].node_tree, ctx, new_groups, memo)
+            reason = vlm_join_rules.generated_reason(part['obj'], ctx)
+            if reason:
+                left.add(reason)
+        alone = sorted(left & vlm_join_rules.BAKE_ALONE)
+        if alone:
+            for mat in new_mats.values():
+                bpy.data.materials.remove(mat)
+            for group in new_groups:
+                bpy.data.node_groups.remove(group)
+            logger.info(f". {part['obj'].name} uses {alone}, it will be baked alone")
+        else:
+            for mi, mat in new_mats.items():
+                old = dup.data.materials[mi]
+                dup.data.materials[mi] = mat
+                mat.node_tree.nodes.active = mat.node_tree.nodes.get("VLM_BakeImage")
+                bpy.data.materials.remove(old)
+            part['mats'] = list(new_mats.values())
+            part['groups'] = new_groups
+            if left:
+                logger.info(f". {part['obj'].name} keeps object dependent shading {sorted(left)}, it will lead its joined bake")
+        part['alone'] = alone[0] if alone else None
+        part['leader'] = bool(left) and not alone
+        part['key'] = vlm_join_rules.join_key(part['obj'])
+        part['transparent'] = vlm_join_rules.is_transparent(part['obj'], dup, bake_col)
+        part['silhouette'] = vlm_join_rules.mask_silhouette(part['mask'])
+
+    def _remove_parts():
+        for part in parts:
+            dup_mesh = part['dup'].data
+            bpy.data.objects.remove(part['dup'])
+            if dup_mesh.users == 0:
+                bpy.data.meshes.remove(dup_mesh)
+            for mat in part['mats']:
+                if mat.name in bpy.data.materials:
+                    bpy.data.materials.remove(mat)
+            for group in part.get('groups', []):
+                if group.name in bpy.data.node_groups:
+                    bpy.data.node_groups.remove(group)
+            for img in part['own_images']:
+                if img.name in bpy.data.images:
+                    bpy.data.images.remove(img)
+
     # Phase 1: prepare every unwrapped object once
     parts = []
     for obj in [obj for obj in bake_col.all_objects if obj.vlmSettings.use_bake]:
@@ -1365,15 +1430,11 @@ def render_all_groups(op, context):
         parts.append({'obj': obj, 'dup': dup, 'mask': obj_mask, 'mats': mat_copies, 'img': bake_img,
                       'img_alb': bake_img_albedo, 'img_nm': bake_img_normal,
                       'own_images': own_images})
+        if join_on and obj.name not in bake_alone and not obj.vlmSettings.bake_mask and not obj.vlmSettings.hide_from_others:
+            _prepare_join(parts[-1])
 
     # Phase 2: bake each lighting scenario, joining the static objects that need it
     n_joined_bakes = n_single_bakes = 0
-    # a part with a bake mask always bakes alone (its
-    # mask would shadow the other members, and a shared mask cannot be linked twice). scene['vlm_bake_alone'] = comma-separated
-    # object names that bake alone (e.g. transparent parts with other members beneath them: in a joined bake those members are
-    # the same object, so they show through and get baked into it). scene['vlm_joined_bake'] = True turns joining on.
-    join_on = bool(context.scene.get('vlm_joined_bake', False))   # opt-in until the joined-bake rules are settled
-    bake_alone = {n.strip() for n in str(context.scene.get('vlm_bake_alone', '')).split(',') if n.strip()}
     logger.info(f". Joined bake {'on' if join_on else 'OFF'} (patch 12); always alone: masked parts"
                 + (f" + {sorted(bake_alone)}" if bake_alone else ''))
     for i, scenario in enumerate(light_scenarios, start=1):
@@ -1396,9 +1457,24 @@ def render_all_groups(op, context):
                 todo.append(part)
         if not todo:
             continue
-        joinable = [p for p in todo if join_on and p['obj'].name not in bake_alone and not p['obj'].vlmSettings.bake_mask
-                    and not p['obj'].vlmSettings.hide_from_others and not any(_find_direct_owners(root, p['obj']) for root, kind in own_roots)]
-        groups = ([joinable] if len(joinable) > 1 else []) + [[p] for p in todo if p not in joinable or len(joinable) == 1]
+        joinable, held_out = [], {}
+        for p in todo if join_on else []:
+            obj = p['obj']
+            reason = ('vlm_bake_alone' if obj.name in bake_alone else 'bake mask' if obj.vlmSettings.bake_mask
+                      else 'hide from others' if obj.vlmSettings.hide_from_others
+                      else 'light linked' if any(_find_direct_owners(root, obj) for root, kind in own_roots) else p['alone'])
+            if reason:
+                held_out[reason] = held_out.get(reason, 0) + 1
+            else:
+                joinable.append(p)
+        joined_groups = [g for g in vlm_join_rules.join_groups(joinable) if len(g) > 1]
+        in_joins = {id(p) for g in joined_groups for p in g}
+        if len(joinable) > len(in_joins):
+            held_out['no join partner'] = len(joinable) - len(in_joins)
+        groups = joined_groups + [[p] for p in todo if id(p) not in in_joins]
+        if join_on:
+            logger.info(f". Joined bake for '{name}' ({i}/{n_lighting_situations}): {len(joined_groups)} joined bakes of {[len(g) for g in joined_groups]} objects, "
+                        f"{len(todo) - len(in_joins)} single bakes" + (f" ({', '.join(f'{k}: {v}' for k, v in sorted(held_out.items()))})" if held_out else ''))
 
         for group in groups:
             initial_state, prev_world = _setup_bake_lights(scenario)
@@ -1423,7 +1499,22 @@ def render_all_groups(op, context):
                     copies.append(c)
                 with context.temp_override(scene=scene, view_layer=render_view_layer, active_object=copies[0],
                                            selected_objects=copies, selected_editable_objects=copies):
-                    bpy.ops.object.join()
+                    try:
+                        result = bpy.ops.object.join()
+                    except RuntimeError as exc:
+                        logger.warning(f"Joined bake: join raised {exc}")
+                        result = {'CANCELLED'}
+                if result != {'FINISHED'}:
+                    for c in copies:
+                        if c.name in bpy.data.objects:
+                            bpy.data.objects.remove(c)
+                    for m in temp_meshes:
+                        if m.name in bpy.data.meshes and m.users == 0:
+                            bpy.data.meshes.remove(m)
+                    restore_light_setup(initial_state, render_col, lights, scene, prev_world)
+                    _leave_bake(group)
+                    _remove_parts()
+                    raise RuntimeError(f"Joined bake of {[p['obj'].name for p in group]} for '{name}' failed: join returned {result}")
                 target = copies[0]
                 target.data.uv_layers['UVMap'].active = True
                 logger.info(_progress(f". Joined bake of {len(group)} objects for '{name}' ({i}/{n_lighting_situations}): {', '.join(p['obj'].name for p in group)}."))
@@ -1453,17 +1544,7 @@ def render_all_groups(op, context):
                 n_render_performed += 1
 
     # Cleanup of the prepared objects
-    for part in parts:
-        dup_mesh = part['dup'].data
-        bpy.data.objects.remove(part['dup'])
-        if dup_mesh.users == 0:
-            bpy.data.meshes.remove(dup_mesh)
-        for mat in part['mats']:
-            if mat.name in bpy.data.materials:
-                bpy.data.materials.remove(mat)
-        for img in part['own_images']:
-            if img.name in bpy.data.images:
-                bpy.data.images.remove(img)
+    _remove_parts()
     logger.info(f". Unwrapped bakes: {n_joined_bakes} joined bakes and {n_single_bakes} single bakes")
 
     if bake_info_group: bake_info_group.nodes['IsBake'].outputs["Value"].default_value = 0.0

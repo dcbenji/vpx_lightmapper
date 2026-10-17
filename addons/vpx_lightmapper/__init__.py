@@ -108,6 +108,10 @@ if dependencies_installed:
         importlib.reload(vlm_group_baker)
     else:
         from . import vlm_group_baker
+    if "vlm_join_rules" in locals():
+        importlib.reload(vlm_join_rules)
+    else:
+        from . import vlm_join_rules
     if "vlm_render_baker" in locals():
         importlib.reload(vlm_render_baker)
     else:
